@@ -17,11 +17,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# Blackwell (SM120, compute capability 12.0) and future architectures do not have precompiled
+# kernels-community wheels in the Hugging Face hub repositories, so we fall back to PyTorch's
+# native scaled_dot_product_attention.
+use_fa3 = cap[0] < 10
+if use_fa3:
+    from kernels import get_kernel
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
+else:
+    fa3 = None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -90,8 +96,41 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
+        if use_fa3:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = y.contiguous().view(B, T, -1)
+        else:
+            # Fallback using PyTorch's scaled_dot_product_attention.
+            # fa3 expects input shapes (B, T, H, D), while PyTorch SDPA expects (B, H, T, D).
+            q_trans = q.transpose(1, 2)
+            k_trans = k.transpose(1, 2)
+            v_trans = v.transpose(1, 2)
+
+            # Grouped Query Attention handling (if n_kv_head < n_head)
+            H, H_k = q_trans.size(1), k_trans.size(1)
+            if H_k < H:
+                num_queries_per_kv = H // H_k
+                k_trans = k_trans.repeat_interleave(num_queries_per_kv, dim=1)
+                v_trans = v_trans.repeat_interleave(num_queries_per_kv, dim=1)
+
+            # Sliding window causal attention mask
+            window_size_left = window_size[0]
+            if window_size_left >= T or window_size_left < 0:
+                # Standard causal attention
+                y_trans = F.scaled_dot_product_attention(
+                    q_trans, k_trans, v_trans, is_causal=True
+                )
+            else:
+                # Custom sliding window causal mask
+                q_idx = torch.arange(T, device=q.device).unsqueeze(1)
+                k_idx = torch.arange(T, device=q.device).unsqueeze(0)
+                mask = (k_idx <= q_idx) & (q_idx - k_idx < window_size_left)
+                y_trans = F.scaled_dot_product_attention(
+                    q_trans, k_trans, v_trans, attn_mask=mask
+                )
+
+            # Transpose back to (B, T, H, D) and reshape
+            y = y_trans.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
